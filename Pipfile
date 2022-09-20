@@ -13,6 +13,8 @@ pyyaml = "*"
 pylint = "*"
 moto = "*"
 coverage = "*"
+patch = "*"
+mock = "*"
 
 [dev-packages]
 

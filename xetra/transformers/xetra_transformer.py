@@ -2,7 +2,11 @@
 import logging
 from typing import NamedTuple
 
+import pandas as pd
+from datetime import datetime
+import xetra.common.meta_process
 from xetra.common.s3 import S3BucketConnector
+from xetra.common.meta_process import MetaProcess, MetaProcessFormat
 
 
 class XetraSourceConfig(NamedTuple):
@@ -85,18 +89,82 @@ class XetraETL():
         self.meta_key = meta_key
         self.src_args = src_args
         self.trg_args = trg_args
-        # self.extract_date =
-        # self.extract_date_list =
-        # self.meta_update_list =
+        self.extract_date, self.extract_date_list = MetaProcess.return_date_list(
+            self.src_args.src_first_extract_date, self.meta_key, self.s3_bucket_trg
+        )
+        self.meta_update_list = [date for date in self.extract_date_list if date >= self.extract_date]
 
     def extract(self):
-        pass
+        self._logger.info('Extracting Xetra source files started...')
+        files = [key for date in self.extract_date_list for key in self.s3_bucket_src.list_filex_in_prefix(date)]
+        if not files:
+            data_frame = pd.DataFrame()
+        else:
+            data_frame = pd.concat([self.s3_bucket_src.read_csv_to_df(file) for file in files], ignore_index=True)
+        self._logger.info('Extracting Xetra source files finished')
+        return data_frame
 
-    def transform_report1(self):
-        pass
+    def transform_report1(self, data_frame: pd.DataFrame):
+        if data_frame.empty:
+            self._logger.info('The dataframe is empty. No transformations will ne applied.')
+            return data_frame
+        self._logger.info('Applying transformations to Xetra source data for report 1 started...')
+        data_frame = data_frame.loc[:, self.src_args.src_columns]
+        data_frame.dropna(inplace=True)
+        data_frame[self.trg_args.trg_col_op_price] = data_frame.sort_values(by=[self.src_args.src_col_time]).groupby([
+            self.src_args.src_col_isin,
+            self.src_args.src_col_date
+        ])[self.src_args.src_col_starting_price].transform('first')
 
-    def load(self):
-        pass
+        data_frame[self.trg_args.trg_col_clos_price] = data_frame.sort_values(by=[self.src_args.src_col_time]).groupby([
+            self.src_args.src_col_isin,
+            self.src_args.src_col_date
+        ])[self.src_args.src_col_starting_price].transform('last')
+
+        data_frame.rename(columns={
+            self.src_args.src_col_min_price: self.trg_args.trg_col_min_price,
+            self.src_args.src_col_max_price: self.trg_args.trg_col_max_price,
+            self.src_args.src_col_traded_vol: self.trg_args.trg_col_daily_trad_vol
+        }, inplace=True)
+
+        data_frame = data_frame.groupby([
+            self.src_args.src_col_isin,
+            self.src_args.src_col_date], as_index=False
+        ).agg({
+            self.trg_args.trg_col_op_price: 'min',
+            self.trg_args.trg_col_clos_price: 'min',
+            self.trg_args.trg_col_min_price: 'min',
+            self.trg_args.trg_col_max_price: 'max',
+            self.trg_args.trg_col_daily_trad_vol: 'sum'
+        })
+
+        data_frame[self.trg_args.trg_col_ch_prev_clos] = data_frame.sort_values(by=self.src_args.src_col_date).groupby(
+            [self.src_args.src_col_isin])[self.trg_args.trg_col_op_price].shift(1)
+
+        data_frame[self.trg_args.trg_col_ch_prev_clos] = (
+                                                                 data_frame[self.trg_args.trg_col_op_price] -
+                                                                 data_frame[self.trg_args.trg_col_ch_prev_clos]
+                                                         ) / data_frame[self.trg_args.trg_col_ch_prev_clos] * 100
+
+        data_frame = data_frame.round(decimals=2)
+        data_frame = data_frame[data_frame.Date >= self.extract_date].reset_index(drop=True)
+        self._logger.info('Applying transformations to Xetra source data finished...')
+        return data_frame
+
+    def load(self, data_frame: pd.DataFrame):
+        target_key = (
+            f'{self.trg_args.trg_key}'
+            f'{datetime.today().strftime(self.trg_args.trg_key_date_format)}.'
+            f'{self.trg_args.trg_format}'
+        )
+        self.s3_bucket_trg.write_df_to_s3(data_frame, target_key, self.trg_args.trg_format)
+        self._logger.info('Xetra target data successfully written.')
+        MetaProcess.update_meta_file(self.meta_update_list, self.meta_key, self.s3_bucket_trg)
+        self._logger.info('Xetra meta file successfully updated.')
+        return True
 
     def etl_report1(self):
-        pass
+        data_frame = self.extract()
+        data_frame = self.transform_report1(data_frame)
+        self.load(data_frame)
+        return True
